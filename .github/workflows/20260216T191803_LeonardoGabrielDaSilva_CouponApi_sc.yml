@@ -1,0 +1,219 @@
+
+name: Grilo SC Analysis for Java (Maven/Gradle)
+
+on:
+  push:
+    branches: [ "master", "main" ]
+  workflow_dispatch: {}
+
+jobs:
+  sonar-analysis:
+    name: SonarCloud Analysis
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # =========================================================================
+      # SETUP DO AMBIENTE DE BUILD
+      # =========================================================================
+      - name: Setup Build Environment
+        id: setup_env
+        run: |
+          echo "🔍 Detectando sistema de build..."
+          
+          # =================================================================
+          # CORREÇÃO UNIVERSAL: Criar google-services.json falso para Firebase
+          # Usando base64 para evitar problemas de escape YAML
+          # =================================================================
+          echo "📱 Verificando necessidade de google-services.json..."
+          
+          if grep -rq "com.google.gms.google-services" . 2>/dev/null || grep -rq "google-services" . 2>/dev/null; then
+            echo "🔥 Projeto usa Firebase/Google Services"
+            
+            # Encontra todos os diretórios 'app' que possam precisar do arquivo
+            for app_dir in $(find . -type d -name "app"); do
+              if [ ! -f "$app_dir/google-services.json" ]; then
+                echo "📝 Criando google-services.json dummy em: $app_dir"
+                echo "ewogICJwcm9qZWN0X2luZm8iOiB7CiAgICAicHJvamVjdF9udW1iZXIiOiAiMDAwMDAwMDAwMDAwIiwKICAgICJwcm9qZWN0X2lkIjogImR1bW15LXByb2plY3QtZm9yLWNpIiwKICAgICJzdG9yYWdlX2J1Y2tldCI6ICJkdW1teS1wcm9qZWN0LWZvci1jaS5hcHBzcG90LmNvbSIKICB9LAogICJjbGllbnQiOiBbCiAgICB7CiAgICAgICJjbGllbnRfaW5mbyI6IHsKICAgICAgICAibW9iaWxlc2RrX2FwcF9pZCI6ICIxOjAwMDAwMDAwMDAwMDphbmRyb2lkOjAwMDAwMDAwMDAwMDAwMDAwMDAwMDAiLAogICAgICAgICJhbmRyb2lkX2NsaWVudF9pbmZvIjogewogICAgICAgICAgInBhY2thZ2VfbmFtZSI6ICJjb20uZXhhbXBsZS5hcHAiCiAgICAgICAgfQogICAgICB9LAogICAgICAiYXBpX2tleSI6IFsKICAgICAgICB7CiAgICAgICAgICAiY3VycmVudF9rZXkiOiAiQUl6YVN5RHVtbXlLZXlGb3JDSUJ1aWxkT25seTAwMDAwMDAwMCIKICAgICAgICB9CiAgICAgIF0KICAgIH0KICBdLAogICJjb25maWd1cmF0aW9uX3ZlcnNpb24iOiAiMSIKfQo=" | base64 -d > "$app_dir/google-services.json"
+              fi
+            done
+          fi
+          
+          # =================================================================
+          # 1. MAVEN
+          # =================================================================
+          POM_PATH=$(find . -maxdepth 3 -name "pom.xml" -not -path "*/target/*" | head -n 1)
+          
+          if [ -n "$POM_PATH" ]; then
+            echo "✅ Maven detectado em: $POM_PATH"
+            echo "build_system=maven" >> $GITHUB_OUTPUT
+            echo "build_file=$POM_PATH" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # =================================================================
+          # 2. GRADLE (com detecção dinâmica de versão)
+          # =================================================================
+          GRADLE_FILE=$(find . -maxdepth 3 \( -name "build.gradle" -o -name "build.gradle.kts" \) -type f | head -n 1)
+          
+          if [ -n "$GRADLE_FILE" ]; then
+            echo "✅ Gradle detectado em: $GRADLE_FILE"
+            echo "build_system=gradle" >> $GITHUB_OUTPUT
+            echo "build_file=$GRADLE_FILE" >> $GITHUB_OUTPUT
+            
+            # Detecção dinâmica da versão do Gradle
+            PROPS=$(find . -name "gradle-wrapper.properties" -type f | head -n 1)
+            TARGET_VERSION="8.10.2"
+            
+            if [ -f "$PROPS" ]; then
+               echo "📄 Arquivo de propriedades encontrado: $PROPS"
+               ver=$(grep -oE 'gradle-[0-9.]+(-(bin|all))?\.zip' "$PROPS" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n 1)
+               if [ -n "$ver" ]; then
+                 TARGET_VERSION="$ver"
+                 echo "✅ Versão detectada no projeto: $TARGET_VERSION"
+               else
+                 echo "⚠️ Não foi possível extrair versão do properties, usando fallback: $TARGET_VERSION"
+               fi
+            else
+               echo "⚠️ gradle-wrapper.properties não encontrado, usando fallback: $TARGET_VERSION"
+            fi
+            
+            echo "detected_gradle_ver=$TARGET_VERSION" >> $GITHUB_OUTPUT
+            
+            # Download e instalação do Gradle
+            echo "⬇️ Baixando Gradle $TARGET_VERSION..."
+            wget -q "https://services.gradle.org/distributions/gradle-${TARGET_VERSION}-bin.zip" || {
+              echo "❌ Falha ao baixar Gradle, continuando sem build"
+              exit 0
+            }
+            unzip -q "gradle-${TARGET_VERSION}-bin.zip"
+            echo "GRADLE_HOME=$PWD/gradle-${TARGET_VERSION}/bin" >> $GITHUB_ENV
+            echo "$PWD/gradle-${TARGET_VERSION}/bin" >> $GITHUB_PATH
+            echo "✅ Gradle $TARGET_VERSION instalado com sucesso"
+          else
+             echo "⚠️ Nenhum build system detectado"
+             echo "build_system=unknown" >> $GITHUB_OUTPUT
+          fi
+
+      # =========================================================================
+      # SETUP JAVA
+      # =========================================================================
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: 21
+          distribution: 'temurin'
+
+      # =========================================================================
+      # MAVEN: Compila e analisa
+      # =========================================================================
+      - name: Maven Build and Analysis
+        if: steps.setup_env.outputs.build_system == 'maven'
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          mvn -B verify org.sonarsource.scanner.maven:sonar-maven-plugin:sonar \
+            -Dmaven.test.skip=true \
+            -f ${{ steps.setup_env.outputs.build_file }} \
+            -Dsonar.projectKey=grilo-org_20260216T191803_LeonardoGabrielDaSilva_CouponApi \
+            -Dsonar.projectName=20260216T191803_LeonardoGabrielDaSilva_CouponApi \
+            -Dsonar.host.url=https://sonarcloud.io \
+            -Dsonar.organization=grilo-org || {
+              echo "⚠️ Build Maven falhou, tentando análise source-only..."
+            }
+
+      # =========================================================================
+      # GRADLE: Tenta compilar (mas não falha se não conseguir)
+      # =========================================================================
+      - name: Gradle Build (Best Effort)
+        if: steps.setup_env.outputs.build_system == 'gradle'
+        id: gradle_build
+        continue-on-error: true
+        run: |
+          BUILD_DIR=$(dirname "${{ steps.setup_env.outputs.build_file }}")
+          cd "$BUILD_DIR"
+          
+          echo "🚀 Tentando compilar com Gradle (Versão: ${{ steps.setup_env.outputs.detected_gradle_ver }})..."
+          
+          # Múltiplas estratégias de build
+          if gradle compileDebugSources -x test -x lint --no-daemon 2>/dev/null; then
+            echo "✅ Build (compileDebugSources) concluído."
+            echo "build_success=true" >> $GITHUB_OUTPUT
+          elif gradle compileKotlin -x test --no-daemon 2>/dev/null; then
+            echo "✅ Build (compileKotlin) concluído."
+            echo "build_success=true" >> $GITHUB_OUTPUT
+          elif gradle compileJava -x test --no-daemon 2>/dev/null; then
+            echo "✅ Build (compileJava) concluído."
+            echo "build_success=true" >> $GITHUB_OUTPUT
+          elif gradle classes -x test --no-daemon 2>/dev/null; then
+            echo "✅ Build (classes) concluído."
+            echo "build_success=true" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️ Build falhou, mas continuando para análise de código fonte."
+            echo "build_success=false" >> $GITHUB_OUTPUT
+          fi
+
+      # =========================================================================
+      # SONARCLOUD SCAN (sempre executa para Gradle)
+      # =========================================================================
+      - name: SonarCloud Scan
+        if: steps.setup_env.outputs.build_system == 'gradle'
+        uses: SonarSource/sonarqube-scan-action@v5.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >
+            -Dsonar.projectKey=grilo-org_20260216T191803_LeonardoGabrielDaSilva_CouponApi
+            -Dsonar.projectName=20260216T191803_LeonardoGabrielDaSilva_CouponApi
+            -Dsonar.organization=grilo-org
+            -Dsonar.java.binaries=**/build/classes,**/build/intermediates/javac,**/build/tmp/kotlin-classes,**/target/classes
+            -Dsonar.sources=.
+            -Dsonar.exclusions=**/*.class,**/build/**,**/gradle/**,**/target/**,.gradle/**
+
+      # =========================================================================
+      # ANÁLISE SOURCE-ONLY (fallback para build_system unknown)
+      # =========================================================================
+      - name: SonarCloud Scan (Source Only)
+        if: steps.setup_env.outputs.build_system == 'unknown'
+        uses: SonarSource/sonarqube-scan-action@v5.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >
+            -Dsonar.projectKey=grilo-org_20260216T191803_LeonardoGabrielDaSilva_CouponApi
+            -Dsonar.projectName=20260216T191803_LeonardoGabrielDaSilva_CouponApi
+            -Dsonar.organization=grilo-org
+            -Dsonar.sources=.
+
+      # =========================================================================
+      # RELATÓRIO FINAL
+      # =========================================================================
+      - name: Analysis Summary
+        if: always()
+        run: |
+          echo "============================================================"
+          echo "📊 RESUMO DA ANÁLISE SONARCLOUD"
+          echo "============================================================"
+          echo ""
+          echo "Projeto: 20260216T191803_LeonardoGabrielDaSilva_CouponApi"
+          echo "Build System: ${{ steps.setup_env.outputs.build_system }}"
+          echo ""
+          if [ "${{ steps.gradle_build.outputs.build_success }}" == "true" ]; then
+            echo "✅ Build: SUCESSO"
+            echo "   Análise completa com binários disponíveis."
+          else
+            echo "⚠️ Build: FALHOU ou NÃO EXECUTADO"
+            echo "   Análise realizada apenas com código-fonte."
+            echo "   Algumas métricas podem estar incompletas."
+          fi
+          echo ""
+          echo "Dashboard: https://sonarcloud.io/dashboard?id=grilo-org_20260216T191803_LeonardoGabrielDaSilva_CouponApi"
+          echo "============================================================"
